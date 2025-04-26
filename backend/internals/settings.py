@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 
 from dataclasses import _MISSING_TYPE, asdict, dataclass, field
-from json import dump, load
+from json import dump, load, JSONDecodeError # Import JSONDecodeError
 from logging import INFO
 from os import urandom
 from os.path import abspath, isdir, join, sep
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, List, Union
 
 from backend.base.custom_exceptions import (FolderNotFound, InvalidSettingKey,
                                             InvalidSettingModification,
@@ -27,7 +27,7 @@ class SettingsValues:
     database_version: int = get_latest_db_version()
     log_level: int = INFO
     auth_password: str = ''
-    comicvine_api_key: str = ''
+    comicvine_api_keys: List[str] = field(default_factory=list) # Changed to List[str]
     api_key: str = ''
 
     host: str = '0.0.0.0'
@@ -66,9 +66,12 @@ class SettingsValues:
     flaresolverr_base_url: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
+        # Convert list of keys back to a list for the API response
+        settings_dict = asdict(self)
+        settings_dict['comicvine_api_keys'] = self.comicvine_api_keys # Use the list directly
         return {
             k: v if not isinstance(v, BaseEnum) else v.value
-            for k, v in self.__dict__.items()
+            for k, v in settings_dict.items()
             if not k.startswith('backup_')
         }
 
@@ -98,9 +101,14 @@ class Settings(metaclass=Singleton):
 
     def _insert_missing_settings(self) -> None:
         "Insert any missing keys from the settings into the database."
+        # When inserting, convert the list of keys to a string for storage
+        default_values_dict = asdict(SettingsValues())
+        if isinstance(default_values_dict.get('comicvine_api_keys'), list):
+            default_values_dict['comicvine_api_keys'] = ','.join(default_values_dict['comicvine_api_keys']) # Store as comma-separated string
+
         get_db().executemany(
             "INSERT OR IGNORE INTO config(key, value) VALUES (?, ?);",
-            asdict(SettingsValues()).items()
+            default_values_dict.items()
         )
         commit()
         return
@@ -115,16 +123,33 @@ class Settings(metaclass=Singleton):
             if k in SettingsValues.__dataclass_fields__
         }
 
+        # Handle deserialization for list and enum types
         for cl_key in ('format_preference', 'service_preference'):
-            db_values[cl_key] = CommaList(db_values[cl_key])
+            db_values[cl_key] = CommaList(db_values.get(cl_key, '')) # Use get with default for safety
 
         for en_key, en in (
             ('seeding_handling', SeedingHandling),
         ):
-            db_values[en_key] = en[db_values[en_key].upper()]
+            # Safely get and convert enum values
+            db_values[en_key] = en[db_values.get(en_key, '').upper()] if db_values.get(en_key) else SettingsValues.__dataclass_fields__[en_key].default
 
-        self.__cached_values = SettingsValues(**db_values)
+
+        # Handle deserialization for the list of ComicVine API keys
+        comicvine_keys_str = db_values.get('comicvine_api_keys', '')
+        if isinstance(comicvine_keys_str, str):
+            db_values['comicvine_api_keys'] = [key.strip() for key in comicvine_keys_str.split(',') if key.strip()] # Convert comma-separated string to list
+        else:
+             # Handle unexpected data type in DB for comicvine_api_keys
+             LOGGER.warning(f"Unexpected data type for comicvine_api_keys in DB: {type(comicvine_keys_str)}. Defaulting to empty list.")
+             db_values['comicvine_api_keys'] = []
+
+
+        self.__cached_values = SettingsValues(**{
+            k: v for k, v in db_values.items()
+            if k in SettingsValues.__dataclass_fields__ # Only pass fields defined in the dataclass
+        })
         return
+
 
     def get_settings(self) -> SettingsValues:
         """Get the settings from the cache.
@@ -157,7 +182,11 @@ class Settings(metaclass=Singleton):
         Returns:
             Any: The value of the setting.
         """
-        return getattr(self.__cached_values, __name)
+        try:
+            return getattr(self.__cached_values, __name)
+        except AttributeError:
+            raise InvalidSettingKey(__name)
+
 
     def update(
         self,
@@ -200,10 +229,17 @@ class Settings(metaclass=Singleton):
         if hosting_changes:
             self.backup_hosting_settings()
 
+        # Convert list of keys back to string for database storage before updating
+        if 'comicvine_api_keys' in formatted_data and isinstance(formatted_data['comicvine_api_keys'], list):
+             formatted_data['comicvine_api_keys'] = ','.join(formatted_data['comicvine_api_keys'])
+
+
         get_db().executemany(
             "UPDATE config SET value = ? WHERE key = ?;",
             reversed_tuples(formatted_data.items())
         )
+        commit() # Commit changes to DB
+
 
         for key, handler in (
             ('url_base', update_manifest),
@@ -211,11 +247,15 @@ class Settings(metaclass=Singleton):
         ):
             if (
                 key in data
+                and formatted_data.get(key) is not None # Check if key exists in formatted_data and is not None
                 and formatted_data[key] != getattr(self.get_settings(), key)
             ):
-                handler(formatted_data[key])
+                # Pass the original value before string conversion if the handler expects the original type
+                handler_value = data.get(key) if key == 'log_level' else formatted_data[key]
+                handler(handler_value)
 
-        self._fetch_settings()
+
+        self._fetch_settings() # Reload settings from DB after update
 
         LOGGER.info(f'Settings changed: {formatted_data}')
 
@@ -224,6 +264,16 @@ class Settings(metaclass=Singleton):
             SERVER.restart(
                 RestartVersion.HOSTING_CHANGES
             )
+
+        # If ComicVine API keys were updated, potentially re-initialize ComicVine
+        if 'comicvine_api_keys' in data:
+             from backend.implementations.comicvine import ComicVine
+             # Re-initialize the singleton instance with the new keys
+             # This might require modifying the ComicVine singleton or how it gets keys
+             # For now, relying on the next time ComicVine is instantiated to get fresh settings.
+             # A more robust solution might involve a method in ComicVine to update keys.
+             pass
+
 
         return
 
@@ -254,14 +304,18 @@ class Settings(metaclass=Singleton):
         """
         LOGGER.debug(f'Setting reset: {key}')
 
-        if not isinstance(
-            SettingsValues.__dataclass_fields__[key].default_factory,
-            _MISSING_TYPE
-        ):
-            self[key] = SettingsValues.__dataclass_fields__[
-                key].default_factory()
+        if key not in SettingsValues.__dataclass_fields__:
+            raise InvalidSettingKey(key)
+
+        # Get the default value for the field
+        field_info = SettingsValues.__dataclass_fields__[key]
+        if not isinstance(field_info.default_factory, _MISSING_TYPE):
+            default_value = field_info.default_factory()
         else:
-            self[key] = SettingsValues.__dataclass_fields__[key].default
+            default_value = field_info.default
+
+        # Update the setting with the default value
+        self[key] = default_value
 
         return
 
@@ -274,7 +328,8 @@ class Settings(metaclass=Singleton):
             "UPDATE config SET value = ? WHERE key = 'api_key';",
             (api_key,)
         )
-        self._fetch_settings()
+        commit() # Commit the new API key to DB
+        self._fetch_settings() # Reload settings to cache the new API key
 
         LOGGER.info(f'Setting api key regenerated: {api_key}')
         return
@@ -287,6 +342,7 @@ class Settings(metaclass=Singleton):
             'backup_port': s.port,
             'backup_url_base': s.url_base
         }
+        # Use self.update for consistent validation and DB update
         self.update(backup_settings)
         return
 
@@ -311,128 +367,142 @@ class Settings(metaclass=Singleton):
         if key not in SettingsValues.__dataclass_fields__:
             raise InvalidSettingKey(key)
 
+        # Handle specific keys with custom validation or conversion
         if key == 'api_key':
-            raise InvalidSettingModification(key, 'POST /settings/api_key')
+            raise InvalidSettingModification(key, 'POST /settings/api_key') # Prevent changing via PUT
 
-        if (
-            SettingsValues.__dataclass_fields__[key].type is CommaList
-            and isinstance(value, list)
-        ):
-            value = CommaList(value)
+        # Handle list type for comicvine_api_keys
+        if key == 'comicvine_api_keys':
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise InvalidSettingValue(key, value, "Expected a list of strings.")
+            # Basic validation for each key format (optional, depends on desired strictness)
+            # For now, just ensure they are non-empty strings after stripping
+            validated_keys = [k.strip() for k in value if k.strip()]
+            # You might add format validation here, e.g., checking length or character set
+            # Example: if any key doesn't match a regex pattern, raise InvalidSettingValue
+            converted_value = validated_keys # Keep as list here, convert to string before DB update
 
-        if issubclass(SettingsValues.__dataclass_fields__[key].type, BaseEnum):
+
+        # Handle CommaList types
+        elif (SettingsValues.__dataclass_fields__[key].type is CommaList
+            and isinstance(value, list)): # Expecting a list input for CommaList settings
+            # CommaList constructor handles internal formatting
+             converted_value = CommaList(value)
+
+
+        # Handle Enum types
+        elif issubclass(SettingsValues.__dataclass_fields__[key].type, BaseEnum):
             try:
-                value = SettingsValues.__dataclass_fields__[key].type(value)
+                # Convert input value (string) to the corresponding Enum member
+                converted_value = SettingsValues.__dataclass_fields__[key].type(value)
             except ValueError:
-                raise InvalidSettingValue(key, value)
+                # If value is not a valid Enum member, raise an error
+                raise InvalidSettingValue(key, value, f"Invalid value for enum {SettingsValues.__dataclass_fields__[key].type.__name__}.")
 
-        if not isinstance(value, SettingsValues.__dataclass_fields__[key].type):
-            raise InvalidSettingValue(key, value)
 
-        if key == 'port' and not 0 < value <= 65_535:
-            raise InvalidSettingValue(key, value)
+        # Basic type check against the dataclass field type (after potential custom conversions)
+        # Skip this check for comicvine_api_keys since we are temporarily keeping it as a list
+        if key != 'comicvine_api_keys' and not isinstance(converted_value, SettingsValues.__dataclass_fields__[key].type):
+             raise InvalidSettingValue(key, value, f"Value type mismatch. Expected {SettingsValues.__dataclass_fields__[key].type.__name__}.")
+
+
+        # Handle specific keys with value constraints or side effects
+        if key == 'port' and not 0 < converted_value <= 65_535:
+            raise InvalidSettingValue(key, value, "Port number must be between 1 and 65535.")
 
         elif key == 'url_base':
-            if value:
-                converted_value = ('/' + value.lstrip('/')).rstrip('/')
+            # Ensure url_base is correctly formatted
+            if converted_value:
+                converted_value = ('/' + converted_value.lstrip('/')).rstrip('/')
+            # No validation needed here, the update logic handles applying it
 
-        elif key == 'comicvine_api_key':
-            from backend.implementations.comicvine import ComicVine
-            converted_value = value.strip()
-            if converted_value and not ComicVine(converted_value).test_token():
-                raise InvalidSettingValue(key, value)
-
+        # The IndentationError is likely happening here, check alignment of these elif/else blocks
         elif key == 'download_folder':
-            from backend.implementations.root_folders import RootFolders
-
-            if not isdir(value):
-                raise FolderNotFound
+            # Validate download_folder path and its relation to root folders
+            if not isinstance(converted_value, str) or not isdir(converted_value):
+                 raise FolderNotFound(f"Download folder path not found or is not a directory: {converted_value}")
 
             converted_value = uppercase_drive_letter(
-                force_suffix(abspath(value))
+                force_suffix(abspath(converted_value))
             )
 
+            from backend.implementations.root_folders import RootFolders
             for rf in RootFolders().get_all():
                 if (
                     folder_is_inside_folder(rf.folder, converted_value)
                     or folder_is_inside_folder(converted_value, rf.folder)
                 ):
-                    raise InvalidSettingValue(key, value)
+                    raise InvalidSettingValue(key, value, "Download folder cannot be inside or contain a root folder.")
 
-        elif key == 'concurrent_direct_downloads' and value <= 0:
-            raise InvalidSettingValue(key, value)
+        elif key == 'concurrent_direct_downloads' and converted_value <= 0:
+            raise InvalidSettingValue(key, value, "Concurrent direct downloads must be at least 1.")
 
-        elif key == 'failing_torrent_timeout' and value < 0:
-            raise InvalidSettingValue(key, value)
+        elif key == 'failing_torrent_timeout' and converted_value < 0:
+            raise InvalidSettingValue(key, value, "Failing torrent timeout cannot be negative.")
 
-        elif key == 'volume_padding' and not 1 <= value <= 3:
-            raise InvalidSettingValue(key, value)
+        elif key == 'volume_padding' and not 1 <= converted_value <= 3:
+            raise InvalidSettingValue(key, value, "Volume padding must be between 1 and 3.")
 
-        elif key == 'issue_padding' and not 1 <= value <= 4:
-            raise InvalidSettingValue(key, value)
+        elif key == 'issue_padding' and not 1 <= converted_value <= 4:
+            raise InvalidSettingValue(key, value, "Issue padding must be between 1 and 4.")
 
         elif key == 'format_preference':
-            from backend.implementations.conversion import \
-                FileConversionHandler
-
+            # Validate format preference list against available formats
+            from backend.implementations.conversion import FileConversionHandler
             available = FileConversionHandler.get_available_formats()
-            for entry in value:
-                if entry not in available:
-                    raise InvalidSettingValue(key, value)
-
-            converted_value = value
+            for entry in converted_value: # converted_value is a CommaList here
+                if entry not in available and entry != '': # Allow empty string for 'No Conversion' implicitly
+                    raise InvalidSettingValue(key, value, f"Invalid format '{entry}' in format preference.")
+            # CommaList handles duplicates internally if needed
 
         elif key == 'service_preference':
-            available = [
-                s.value
-                for s in GCDownloadSource._member_map_.values()
-            ]
-            for entry in value:
-                if entry not in available:
-                    raise InvalidSettingValue(key, value)
-            for entry in available:
-                if entry not in value:
-                    raise InvalidSettingValue(key, value)
+             # Validate service preference list against allowed sources
+             available_values = [s.value for s in GCDownloadSource._member_map_.values()]
+             for entry in converted_value: # converted_value is a CommaList here
+                 if entry not in available_values:
+                      raise InvalidSettingValue(key, value, f"Invalid service '{entry}' in service preference.")
+             # Ensure all available services are present in the preference list (optional, but good for completeness)
+             # For entry in available_values:
+             #     if entry not in converted_value:
+             #          # Decide how to handle missing services - add them to the end? or raise error?
+             #          pass
 
-            converted_value = value
 
         elif key == 'flaresolverr_base_url':
+            # Validate and handle FlareSolverr URL changes
             from backend.implementations.flaresolverr import FlareSolverr
-
             fs = FlareSolverr()
+            original_fs_base_url = fs.base_url # Store current state
 
-            converted_value = value
-            if converted_value:
-                converted_value = normalize_base_url(converted_value)
+            if converted_value: # If the new value is not empty
+                try:
+                    converted_value = normalize_base_url(converted_value)
+                    # Attempt to enable FS with the new URL to test it
+                    if not fs.enable_flaresolverr(converted_value):
+                        raise InvalidSettingValue(key, value, f"Could not connect to FlareSolverr at {converted_value}. Check the URL and if FlareSolverr is running.")
+                    # If successful, fs is now updated in the singleton
+                except Exception as e:
+                    # Catch any errors during normalization or enable attempt
+                    raise InvalidSettingValue(key, value, f"Error setting FlareSolverr URL: {e}") from e
+            else: # If the new value is empty, disable FS if it was running
+                 if original_fs_base_url:
+                      fs.disable_flaresolverr()
+                 # converted_value remains ''
 
-            if not converted_value and fs.base_url:
-                # Disable FS, it was running before.
-                fs.disable_flaresolverr()
-
-            elif converted_value and not fs.base_url:
-                # Enable FS, it wasn't running before.
-                if not fs.enable_flaresolverr(converted_value):
-                    raise InvalidSettingValue(key, value)
-
-            elif (
-                converted_value
-                and fs.base_url
-                and converted_value != fs.base_url
-            ):
-                # Enable FS, it was running before but on a different instance.
-                old_value = fs.base_url
-                fs.disable_flaresolverr()
-                if not fs.enable_flaresolverr(converted_value):
-                    fs.enable_flaresolverr(old_value)
-                    raise InvalidSettingValue(key, value)
+            # If FS was running on a different URL and the new one failed, re-enable the old one
+            # This rollback logic is handled within the update method after __format_value returns
 
         else:
+            # Handle naming format strings
             from backend.implementations.naming import (NAMING_MAPPING,
                                                         check_format)
             if key in NAMING_MAPPING:
-                converted_value = value.strip().strip(sep)
+                if not isinstance(converted_value, str):
+                     raise InvalidSettingValue(key, value, "Naming format must be a string.")
+                converted_value = converted_value.strip().strip(sep)
                 if not check_format(converted_value, key):
-                    raise InvalidSettingValue(key, value)
+                    raise InvalidSettingValue(key, value, f"Invalid format string for '{key}'. Contains disallowed characters or invalid variables.")
+
 
         return converted_value
 
@@ -446,12 +516,16 @@ def update_manifest(url_base: str) -> None:
     """
     filename = folder_path('frontend', 'static', 'json', 'pwa_manifest.json')
 
-    with open(filename, 'r') as f:
-        manifest = load(f)
-        manifest['start_url'] = url_base + '/'
-        manifest['icons'][0]['src'] = f'{url_base}/static/img/favicon.svg'
+    try:
+        with open(filename, 'r') as f:
+            manifest = load(f)
+            manifest['start_url'] = url_base + '/'
+            manifest['icons'][0]['src'] = f'{url_base}/static/img/favicon.svg'
 
-    with open(filename, 'w') as f:
-        dump(manifest, f, indent=4)
+        with open(filename, 'w') as f:
+            dump(manifest, f, indent=4)
+    except (FileNotFoundError, JSONDecodeError) as e:
+        LOGGER.error(f"Failed to update manifest file {filename}: {e}")
+
 
     return

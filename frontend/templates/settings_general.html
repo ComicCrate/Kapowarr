@@ -3,10 +3,80 @@
 {% block title %}General Settings{% endblock %}
 {% block css %}
 	<link rel="stylesheet" href="{{ url_for('static', filename='css/settings.css') }}">
+    {# Keep the styles from the working version if needed, or adjust for appearance #}
+    <style>
+        /* Styles from the working version's settings.css */
+        #cv-keys-list td:first-child {
+            width: 80%; /* Allocate more space for the key display */
+        }
+         .cv-key-display {
+             /* Style for the readonly input displaying the key */
+             border: none;
+             padding: 0;
+             width: 100%;
+             background-color: transparent; /* Ensure background is transparent */
+             color: inherit; /* Inherit text color */
+             font-family: "Ubuntu Mono", Menlo, Monaco, Consolas, "Courier New", monospace; /* Monospace font */
+         }
+          .delete-cv-key {
+            /* Style for the delete button */
+            width: 30px; /* Fixed width */
+            height: 30px; /* Fixed height */
+            padding: 5px;
+            background-color: var(--error-color); /* Example color */
+            color: var(--light-color); /* Text color for the button */
+            border-radius: 4px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer; /* Indicate clickable */
+          }
+          .delete-cv-key img {
+              height: 15px; /* Icon size */
+              filter: invert(100%); /* Make icon white on colored background */
+          }
+           #new-cv-key-input {
+              /* Style for the input to add a new key */
+               width: 100%;
+               padding: .5rem .75rem;
+               border-radius: 6px;
+               border: 2px solid var(--border-color);
+               background-color: var(--background-color);
+               color: var(--text-color);
+               font-size: 1rem;
+               font-family: "Ubuntu Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
+           }
+           #add-cv-key-button {
+              /* Style for the add key button */
+               padding: .4rem .6rem;
+               border-radius: 4px;
+               color: var(--nav-background-color);
+               background-color: var(--accent-color);
+               cursor: pointer;
+           }
+
+    </style>
 {% endblock %}
 {% block js %}
 	<script src="{{ url_for('static', filename='js/settings_general.js') }}" defer></script>
 {% endblock %}
+
+{% block pre_build_rows %}
+{# Template for a single CV key list row - placed in pre_build_rows as in working version #}
+<tr class="cv-key-entry">
+	<td>
+		{# Readonly input to display the key, stores full key in data-attribute #}
+		<input type="text" value="" readonly class="cv-key-display" title="API Key">
+	</td>
+	<td>
+		{# Button to delete this key row #}
+		<button type="button" class="delete-cv-key" title="Delete Key">
+			<img src="{{ url_for('static', filename='img/delete.svg') }}" alt="Delete">
+		</button>
+	</td>
+</tr>
+{% endblock %}
+
 
 {% block main %}
 <main>
@@ -20,94 +90,141 @@
 			<h2>Host</h2>
 			<p>Changing hosting settings will immediately restart Kapowarr. Access the web-ui within 60 seconds for the changes to stay, or they will be reverted.</p>
 			<table class="fold-table">
-				<tr>
-					<th><label for="bind-address-input">Bind Address</label></th>
-					<td>
-						<input type="text" id="bind-address-input" required spellcheck="false">
-						<p>Valid IPv4 address (default is '0.0.0.0' for all available interfaces).</p>
-					</td>
-				</tr>
-				<tr>
-					<th><label for="port-input">Port Number</label></th>
-					<td>
-						<input type="text" id="port-input" required spellcheck="false">
-						<p>The port used to access the web UI (default is '5656').</p>
-					</td>
-				</tr>
-				<tr>
-					<th><label for="url-base-input">Base URL</label></th>
-					<td>
-						<input type="text" id="url-base-input" spellcheck="false">
-						<p>For reverse proxy support (default is empty).</p>
-					</td>
-				</tr>
+				<tbody> <tr>
+						<th><label for="bind-address-input">Bind Address</label></th>
+						<td>
+							<input type="text" id="bind-address-input" required spellcheck="false">
+							<p>Valid IPv4 address (default is '0.0.0.0' for all available interfaces).</p>
+						</td>
+					</tr>
+					<tr>
+						<th><label for="port-input">Port Number</label></th>
+						<td>
+							<input type="text" id="port-input" required spellcheck="false">
+							<p>The port used to access the web UI (default is '5656').</p>
+						</td>
+					</tr>
+					<tr>
+						<th><label for="url-base-input">Base URL</label></th>
+						<td>
+							<input type="text" id="url-base-input" spellcheck="false">
+							<p>For reverse proxy support (default is empty).</p>
+						</td>
+					</tr>
+				</tbody>
 			</table>
 			<h2>Security</h2>
 			<table class="fold-table">
-				<tr>
-					<th><label for="password-input">Login Password</label></th>
-					<td>
-						<input type="password" id="password-input" required spellcheck="false" autocomplete="new-password">
-						<p>When set, a password is required to be entered to get access to web-UI and API.</p>
-					</td>
-				</tr>
-				<tr>
-					<th><label>API Key</label></th>
-					<td>
-						<div id="api-container" class="icon-light-color">
-							<input type="text" id="api-input" readonly>
-							<button type="button" id="generate-api"><img src="{{url_base}}/static/img/refresh.svg" alt=""></button>
-						</div>
-					</td>
-				</tr>
+				<tbody> <tr>
+						<th><label for="password-input">Login Password</label></th>
+						<td>
+							<input type="password" id="password-input" required spellcheck="false" autocomplete="new-password">
+							<p>When set, a password is required to be entered to get access to web-UI and API.</p>
+						</td>
+					</tr>
+					<tr>
+						<th><label for="api-key-display">API Key</label></th>{# Updated label target #}
+						<td>
+							<div id="api-container" class="icon-light-color">
+								{# Updated ID #}
+								<input type="text" id="api-key-display" readonly>
+								<button type="button" id="generate-api"><img src="{{url_base}}/static/img/refresh.svg" alt=""></button>
+							</div>
+						</td>
+					</tr>
+				</tbody>
 			</table>
 			<h2>External Websites</h2>
 			<table class="fold-table">
-				<tr>
-					<th><label for="cv-input">Comic Vine API Key</label></th>
-					<td>
-						<input type="text" id="cv-input" required spellcheck="false">
-						<p>The API key of the <a href="https://comicvine.gamespot.com/api" target="_blank">Comic Vine API</a>, which is required for Kapowarr to work.</p>
-					</td>
-				</tr>
-				<tr>
-					<th><label for="flaresolverr-input">FlareSolverr Base URL</label></th>
-					<td>
-						<input type="url" name="" id="flaresolverr-input">
-						<p>Base URL of a FlareSolverr instance (set empty to disable). Needed in case of a large amount of requests to CloudFlare protected websites.</p>
-					</td>
-				</tr>
+				<tbody>
+                     <tr>
+						<th><label for="cv-keys-list">Comic Vine API Keys</label></th>{# Label targets the tbody list #}
+						<td>
+							<table class="short-table">
+								{# Tbody for the list of existing keys #}
+								<tbody id="cv-keys-list">
+									{# Existing API key rows will be added here by JavaScript #}
+								</tbody>
+								{# Tbody for adding a new key #}
+								<tbody>
+									<tr>
+										<td>
+											{# Input for entering a new key #}
+											<input type="text" id="new-cv-key-input" placeholder="Enter new API key..." spellcheck="false">
+											{# Error message for CV keys #}
+											<p class="error hidden" id="cv-keys-error">*Please add at least one valid API key.</p>
+										</td>
+										<td>
+											{# Button to add the new key #}
+											<button type="button" id="add-cv-key-button" title="Add Key">
+												<img src="{{ url_for('static', filename='img/add.svg') }}" alt="Add">
+											</button>
+										</td>
+									</tr>
+								</tbody>
+							</table>
+							<p>Add one or more Comic Vine API keys. Kapowarr will cycle through them if one hits the rate limit.</p>
+						</td>
+					</tr>
+
+                    {# Added a row for the ComicVine API URL setting #}
+                    <tr>
+						<th><label for="cv-url-select">ComicVine API URL</label></th>{# Label targets the select #}
+						<td>
+							<select id="cv-url-select">
+								{# Option for the default URL (using Constants from backend) #}
+								<option value="https://comicvine.gamespot.com/api">Default (comicvine.gamespot.com)</option>
+								<option value="custom">Custom...</option>
+							</select>
+							{# Input for custom URL, hidden by default #}
+							<input type="url" id="cv-url-custom-input" class="hidden" placeholder="Enter custom API URL..." spellcheck="false">
+							<p>Select the ComicVine API endpoint or choose 'Custom' to enter your own (e.g., for a caching server).</p>
+							{# Error message for the custom URL #}
+							<p class="error hidden" id="cv-url-error">*Please enter a valid URL (e.g., https://comicvine.gamespot.com/api).</p>
+						</td>
+					</tr>
+
+					<tr>
+						<th><label for="flaresolverr-input">FlareSolverr Base URL</label></th>
+						<td>
+							<input type="url" name="" id="flaresolverr-input">
+							<p>Base URL of a FlareSolverr instance (set empty to disable). Needed in case of a large amount of requests to CloudFlare protected websites.</p>
+						</td>
+					</tr>
+				</tbody>
 			</table>
 			<h2>UI</h2>
 			<table class="fold-table">
-				<tr>
-					<th><label for="theme-input">Theme</label></th>
-					<td>
-						<select id="theme-input">
-							<option value="light">Light</option>
-							<option value="dark">Dark</option>
-						</select>
-					</td>
-				</tr>
+				<tbody> <tr>
+						<th><label for="theme-input">Theme</label></th>
+						<td>
+							<select id="theme-input">
+								<option value="light">Light</option>
+								<option value="dark">Dark</option>
+							</select>
+						</td>
+					</tr>
+				</tbody>
 			</table>
 			<h2>Logging</h2>
 			<table class="fold-table">
-				<tr>
-					<th><label for="log-level-input">Log Level</label></th>
-					<td>
-						<select id="log-level-input" required>
-							<option value="20">Info</option>
-							<option value="10">Debug</option>
-						</select>
-						<p>Change this to 'Debug' if detailed logging is needed for troubleshooting. Change it back to 'Info' when done.</p>
-					</td>
-				</tr>
-				<tr>
-					<th><label for="download-logs-button">Download Logs</label></th>
-					<td>
-						<a id="download-logs-button" href="">Download Logs</a>
-					</td>
-				</tr>
+				<tbody> <tr>
+						<th><label for="log-level-input">Log Level</label></th>
+						<td>
+							<select id="log-level-input" required>
+								<option value="20">Info</option>
+								<option value="10">Debug</option>
+							</select>
+							<p>Change this to 'Debug' if detailed logging is needed for troubleshooting. Change it back to 'Info' when done.</p>
+						</td>
+					</tr>
+					<tr>
+						<th><label for="download-logs-button">Download Logs</label></th>
+						<td>
+							<a id="download-logs-button" href="">Download Logs</a>
+						</td>
+					</tr>
+				</tbody>
 			</table>
 		</form>
 	</div>

@@ -27,7 +27,7 @@ from backend.base.helpers import (AsyncSession, DictKeyedDict, Session,
 from backend.base.logging import LOGGER
 from backend.implementations.matching import _match_title, _match_year
 from backend.internals.db import get_db
-from backend.internals.settings import Settings
+from backend.internals.settings import Settings # Ensure this import is correct
 
 translation_regex = compile(
     r'^<p>\s*\w+ publication(\.?</p>$|,\s| \(in the \w+ language\)|, translates )|' +
@@ -168,26 +168,47 @@ class ComicVine:
     with one issue.
     """
 
-    def __init__(self, comicvine_api_key: Union[str, None] = None) -> None:
+    def __init__(self, comicvine_api_keys: Union[List[str], None] = None) -> None:
         """Start interacting with ComicVine.
 
         Args:
-            comicvine_api_key (Union[str, None], optional): Override the API key
-            that is used.
+            comicvine_api_keys (Union[List[str], None], optional): Override the API keys
+            that are used.
                 Defaults to None.
 
         Raises:
             InvalidComicVineApiKey: No ComicVine API key is set in the settings.
         """
         self.api_url = Constants.CV_API_URL
-        api_key = comicvine_api_key or Settings().sv.comicvine_api_key
-        if not api_key:
-            raise InvalidComicVineApiKey
+        # Use provided keys or get from settings. Ensure it's a list.
+        self.api_keys = comicvine_api_keys if comicvine_api_keys is not None else Settings().sv.comicvine_api_keys
+        if not self.api_keys or not isinstance(self.api_keys, list) or not all(isinstance(key, str) for key in self.api_keys):
+            raise InvalidComicVineApiKey("No valid ComicVine API key(s) set.")
 
+        self._current_key_index = 0
         self.ssn = Session()
-        self._params = {'format': 'json', 'api_key': api_key}
+        # Initial params will use the first key
+        self._params = {'format': 'json', 'api_key': self.current_key}
         self.ssn.params.update(self._params) # type: ignore
         return
+
+    @property
+    def current_key(self) -> str:
+        # Return the API key at the current index
+        if not self.api_keys:
+             raise InvalidComicVineApiKey("No ComicVine API key(s) available.")
+        return self.api_keys[self._current_key_index]
+
+    def _next_key(self) -> None:
+        # Move to the next API key in the list, cycling back to the start if necessary
+        if not self.api_keys:
+            # This should ideally not happen if checked in __init__, but as a safeguard
+            LOGGER.error("Attempted to cycle API keys but no keys are available.")
+            return
+        self._current_key_index = (self._current_key_index + 1) % len(self.api_keys)
+        # Update the API key in the instance's parameters
+        self._params['api_key'] = self.current_key
+        LOGGER.debug(f"Switching to ComicVine API key index: {self._current_key_index}")
 
     async def __call_request(
         self,
@@ -216,7 +237,7 @@ class ComicVine:
         params: Dict[str, Any] = {},
         default: Union[T, None] = None
     ) -> Union[Dict[str, Any], T]:
-        """Make an CV API call asynchronously (with error handling).
+        """Make an CV API call asynchronously (with error handling and retry).
 
         Args:
             session (AsyncSession): The aiohttp session to make the request with.
@@ -238,33 +259,93 @@ class ComicVine:
             reached, and no `default` was supplied.
             InvalidComicVineApiKey: The CV api key is not valid.
             VolumeNotMatched: The volume with the given ID is not found.
+            ClientError: A persistent error occurred after retries.
 
         Returns:
             Union[Dict[str, Any], T]: The raw API response or the value of
             `default` on error.
         """
         url_path = force_suffix('/' + url_path.lstrip('/'), '/')
+        # Merge default parameters with request-specific parameters
+        # Ensure the current key is always used for the request attempt
+        full_params = {**params}
 
-        try:
-            response = await session.get(
-                self.api_url + url_path,
-                params={**self._params, **params}
-            )
-            result: Dict[str, Any] = await response.json()
+        retries = 0
+        # Define a maximum number of retries, e.g., a few times the number of keys
+        max_retries = len(self.api_keys) * 3 # Increased retry attempts
+        base_delay = 5 # seconds
 
-            if result['status_code'] == 107:
-                raise ClientError
-            elif result['status_code'] == 101:
-                raise VolumeNotMatched
-            elif result['status_code'] == 100:
-                raise InvalidComicVineApiKey
+        initial_key_index = self._current_key_index # Remember the starting key index for this call
 
-            return result
+        while retries < max_retries:
+            try:
+                full_params['api_key'] = self.current_key # Use the current key from the cycle
+                response = await session.get(
+                    self.api_url + url_path,
+                    params=full_params
+                )
+                result: Dict[str, Any] = await response.json()
 
-        except (ClientError, ContentTypeError, JSONDecodeError):
+                status_code = result.get('status_code')
+                if status_code == 107:
+                    LOGGER.warning(f"ComicVine API rate limit reached with key index {self._current_key_index}. Retrying...")
+                    retries += 1
+                    self._next_key() # Switch to the next API key
+                    # Implement increasing delay with retries, especially after cycling through all keys
+                    # Delay increases based on the number of full cycles attempted
+                    delay = base_delay * (retries // len(self.api_keys) + 1)
+                    await sleep(delay)
+                    continue # Continue to the next retry attempt
+
+                elif status_code == 101:
+                    # Volume not matched error - not a temporary issue, so raise immediately
+                    raise VolumeNotMatched
+                elif status_code == 100:
+                    # Invalid API key error - indicates a problem with the specific key
+                    # For multiple keys, we might just want to switch and try the next one
+                    LOGGER.warning(f"Invalid ComicVine API key used (index {self._current_key_index}). Switching key.")
+                    retries += 1
+                    self._next_key()
+                    # Add a small delay before trying the next key
+                    await sleep(base_delay)
+                    continue # Continue to the next retry attempt
+                elif status_code is not None and status_code != 1: # Assuming status_code 1 is success
+                     # Other ComicVine API errors - treat as potentially transient or specific to the key
+                     LOGGER.error(f"ComicVine API returned status code {status_code}: {result.get('error')}")
+                     retries += 1
+                     self._next_key() # Try next key
+                     await sleep(base_delay * (retries // len(self.api_keys) + 1))
+                     continue # Continue to next retry attempt
+
+                # Success (status_code == 1)
+                return result
+
+            except (ClientError, ContentTypeError, JSONDecodeError) as e:
+                # Handle network errors, JSON errors, etc.
+                LOGGER.warning(f"Error calling ComicVine API with key index {self._current_key_index}: {e}. Retrying...")
+                retries += 1
+                self._next_key() # Switch key on general errors as well, just in case
+                await sleep(base_delay * (retries // len(self.api_keys) + 1)) # Implement increasing delay
+
+        # If the loop finishes without returning, all retry attempts were exhausted
+        # Determine the most likely cause for the failure
+        final_status_code = result.get('status_code') if 'result' in locals() and isinstance(result, dict) else None
+
+        if final_status_code == 107 or (initial_key_index != self._current_key_index and retries > len(self.api_keys)):
+             # If we encountered rate limits or cycled through all keys multiple times
+             raise CVRateLimitReached("All ComicVine API keys attempted or rate limit persists after multiple retries.")
+        elif final_status_code == 100:
+             # If the last error was an invalid key, and we cycled, it might indicate all keys are invalid or a persistent issue
+              raise InvalidComicVineApiKey("All provided ComicVine API keys failed validation or a persistent authentication error occurred.")
+        else:
+            # For other errors or if default is provided
             if default is not None:
                 return default
-            raise CVRateLimitReached
+            # Re-raise the last caught exception or raise a general client error if no exception was caught
+            # Note: It's better to re-raise the actual exception if available, but requires storing it.
+            # For simplicity here, raising a generic ClientError if no specific CV error code was the final issue.
+            raise ClientError(f"ComicVine API call failed after {retries} retries with last status code: {final_status_code}")
+
 
     def __format_volume_output(
         self,
@@ -371,15 +452,17 @@ class ComicVine:
         ]
 
         # Mark entries that are already added
-        volume_ids: Dict[int, int] = dict(cursor.execute(f"""
-            SELECT comicvine_id, id
-            FROM volumes
-            WHERE {' OR '.join(
-                'comicvine_id = ' + str(r['comicvine_id'])
-                for r in formatted_results
-            )}
-            LIMIT 50;
-        """))
+        # Optimize this query if formatted_results is large
+        cv_ids_to_check = [str(r['comicvine_id']) for r in formatted_results]
+        if cv_ids_to_check:
+             volume_ids: Dict[int, int] = dict(cursor.execute(f"""
+                 SELECT comicvine_id, id
+                 FROM volumes
+                 WHERE comicvine_id IN ({','.join(cv_ids_to_check)});
+             """))
+        else:
+            volume_ids = {}
+
 
         for r in formatted_results:
             r['already_added'] = volume_ids.get(r["comicvine_id"])
@@ -389,24 +472,32 @@ class ComicVine:
         return formatted_results
 
     def test_token(self) -> bool:
-        """Test if the token works.
+        """Test if the token works by attempting a simple API call.
+           This will now also cycle through keys and retry.
 
         Returns:
-            bool: Whether the token works.
+            bool: Whether at least one key works.
         """
         async def _test_token():
             try:
                 async with AsyncSession() as session:
+                    # Use a call that requires authentication but is simple
                     await self.__call_api(
                         session,
                         '/publisher/4010-31',
                         {'field_list': 'id'}
+                        # Do not provide a default, so errors are raised
                     )
-
-            except (CVRateLimitReached, InvalidComicVineApiKey):
+                # If __call_api returns without raising an exception, at least one key worked
+                return True
+            except (CVRateLimitReached, InvalidComicVineApiKey, ClientError):
+                # Catch specific exceptions from __call_api indicating failure
                 return False
+            except Exception as e:
+                 # Catch any unexpected errors during the test
+                 LOGGER.error(f"Unexpected error during ComicVine API key test: {e}")
+                 return False
 
-            return True
 
         return run(_test_token())
 
@@ -418,32 +509,42 @@ class ComicVine:
 
         Raises:
             VolumeNotMatched: No volume found with given ID in CV DB.
-            CVRateLimitReached: The ComicVine rate limit is reached.
+            CVRateLimitReached: The ComicVine rate limit is reached after retries.
+            InvalidComicVineApiKey: All provided API keys are invalid.
+            ClientError: A persistent error occurred after retries.
 
         Returns:
             VolumeMetadata: The metadata of the volume, including issues.
         """
         try:
-            cv_id = to_full_string_cv_id((cv_id,))[0]
+            cv_id_str = to_full_string_cv_id((cv_id,))[0]
         except ValueError:
-            raise VolumeNotMatched
+            raise VolumeNotMatched("Invalid ComicVine ID format provided.")
 
-        LOGGER.debug(f'Fetching volume data for {cv_id}')
+        LOGGER.debug(f'Fetching volume data for {cv_id_str}')
 
         async with AsyncSession() as session:
+            # This call_api will handle retries and key cycling
             result = await self.__call_api(
                 session,
-                f'/volume/{cv_id}',
+                f'/volume/{cv_id_str}',
                 {'field_list': self.volume_field_list}
             )
 
-            volume_info = self.__format_volume_output(result['results'])
+            # Assuming 'results' key is present on success based on existing code
+            volume_info = self.__format_volume_output(result.get('results', {}))
+            if not volume_info or not volume_info.get('comicvine_id'):
+                 # Handle cases where API call succeeded but returned no volume data
+                 raise VolumeNotMatched(f"No volume data returned for ID {cv_id_str}.")
 
-            LOGGER.debug(f'Fetching issue data for volume {cv_id}')
-            volume_info['issues'] = await self.fetch_issues((cv_id,))
+
+            LOGGER.debug(f'Fetching issue data for volume {cv_id_str}')
+            # This fetch_issues call will also use the updated __call_api with retries
+            volume_info['issues'] = await self.fetch_issues((cv_id_str,))
 
             LOGGER.debug(f'Fetching volume data result: {volume_info}')
 
+            # Fetch cover image (also uses an async session and handles potential errors)
             volume_info['cover'] = await self.__call_request(
                 session,
                 volume_info['cover_link']
@@ -465,59 +566,92 @@ class ComicVine:
         try:
             formatted_cv_ids = to_string_cv_id(cv_ids)
         except ValueError:
-            raise VolumeNotMatched
+            # Handle invalid ID format for multiple IDs
+             raise VolumeNotMatched("Invalid ComicVine ID format provided in sequence.")
+
+
+        if not formatted_cv_ids:
+            return [] # Return empty list if no valid IDs provided
 
         LOGGER.debug(f'Fetching volume data for {formatted_cv_ids}')
 
         volume_infos = []
         async with AsyncSession() as session:
-            # 10 requests of 100 vol per round
-            for request_batch in batched(formatted_cv_ids, 1000):
+            # Process IDs in batches suitable for the API filter
+            # The existing batching logic seems reasonable, but each __call_api
+            # within the loop will now handle its own retries and key cycling.
+            # Consider adding an outer retry logic if entire batches consistently fail.
 
-                if request_batch[0] != formatted_cv_ids[0]:
-                    # From second round on
-                    LOGGER.debug(
-                        f"Waiting {Constants.CV_BRAKE_TIME}s to keep the CV rate limit happy")
+            # Example: Adjust batching to ensure filter fits within URL limits if necessary
+            api_filter_batch_size = 100 # As used in the original code
+            request_batch_size = 1000 # As used in the original code, seems high for robustness
+
+            for request_batch_ids in batched(formatted_cv_ids, request_batch_size):
+
+                # Introduce a delay between larger batches to be more polite to the API
+                # This is separate from the retry delay within __call_api
+                if formatted_cv_ids and request_batch_ids[0] != formatted_cv_ids[0]:
+                    LOGGER.debug(f"Waiting {Constants.CV_BRAKE_TIME}s between volume request batches.")
                     await sleep(Constants.CV_BRAKE_TIME)
 
-                # Fetch 10 batches of 100 volumes
-                tasks = [
-                    self.__call_api(
-                        session,
-                        '/volumes',
-                        {
-                            'field_list': self.volume_field_list,
-                            'filter': f'id:{"|".join(id_batch)}'
-                        },
-                        {'results': []}
+                tasks = []
+                for api_filter_batch_ids in batched(request_batch_ids, api_filter_batch_size):
+                    # __call_api handles retries and key cycling for each individual API request
+                    tasks.append(
+                        self.__call_api(
+                            session,
+                            '/volumes',
+                            {
+                                'field_list': self.volume_field_list,
+                                'filter': f'id:{"|".join(api_filter_batch_ids)}'
+                            },
+                            # Provide a default empty list for results in case of retry failure for a batch
+                            # This allows processing of other batches even if one fails
+                            {'results': []}
+                        )
                     )
-                    for id_batch in batched(request_batch, 100)
-                ]
+
                 responses = await gather(*tasks)
 
-                # Format volume responses and prep cover requests
+                # Process responses and prep cover requests concurrently
                 cover_map: Dict[int, Any] = {}
                 current_infos: List[VolumeMetadata] = []
+                cover_tasks = {} # Dictionary to hold cover fetch tasks keyed by ComicVine ID
+
                 for batch in responses:
-                    for result in batch['results']:
+                    # Check if the batch response itself indicates an error despite retries
+                    # This might happen if the default {'results': []} was returned due to failure
+                    if not isinstance(batch, dict) or 'results' not in batch:
+                         LOGGER.warning("Skipping a volume batch due to previous API call failure.")
+                         continue # Skip processing this batch if it doesn't have 'results'
+
+                    for result in batch.get('results', []): # Safely access results
                         volume_info = self.__format_volume_output(result)
                         current_infos.append(volume_info)
 
-                        cover_map[volume_info['comicvine_id']] = self.__call_request(
-                            session, volume_info['cover_link'])
+                        # Prepare cover fetch task for each volume
+                        if volume_info.get('cover_link'):
+                             cover_tasks[volume_info['comicvine_id']] = self.__call_request(
+                                 session, volume_info['cover_link']
+                             )
 
-                # Fetch covers and add them to the volume info
-                cover_responses = dict(zip(
-                    cover_map.keys(),
-                    await gather(*cover_map.values())
-                ))
+                # Execute cover fetch tasks concurrently for this request batch
+                if cover_tasks:
+                    cover_responses = dict(zip(
+                        cover_tasks.keys(),
+                        await gather(*cover_tasks.values())
+                    ))
+                else:
+                    cover_responses = {}
+
+                # Add fetched covers to the corresponding volume info objects
                 for vi in current_infos:
                     vi['cover'] = cover_responses.get(vi['comicvine_id'])
 
-                # Add volume info of this round to total list
+                # Add formatted volume info of this request batch to total list
                 volume_infos.extend(current_infos)
 
-            return volume_infos
+            return volume_infos # Return the accumulated list of volume infos
 
     async def fetch_issues(
         self,
@@ -526,7 +660,7 @@ class ComicVine:
         """Get the metadata of the issues of volumes from ComicVine.
 
         Args:
-            ids (Sequence[Union[str, int]]): The CV ID's of the volumes.
+            cv_ids (Sequence[Union[str, int]]): The CV ID's of the volumes.
 
         Returns:
             List[IssueMetadata]: The metadata of all the issues inside the
@@ -535,64 +669,101 @@ class ComicVine:
         try:
             formatted_cv_ids = to_string_cv_id(cv_ids)
         except ValueError:
-            raise VolumeNotMatched
+            # Handle invalid ID format for multiple IDs
+             raise VolumeNotMatched("Invalid ComicVine ID format provided in sequence.")
+
+
+        if not formatted_cv_ids:
+            return [] # Return empty list if no valid IDs provided
 
         LOGGER.debug(f'Fetching issue data for volumes {formatted_cv_ids}')
 
         issue_infos = []
         async with AsyncSession() as session:
-            for id_batch in batched(formatted_cv_ids, 50):
+            # Process volume IDs in batches for the filter parameter
+            api_filter_batch_size = 50 # As used in the original code
+            request_batch_size = 500 # Example: Process batches of filter batches
+
+            for volume_filter_batch_ids in batched(formatted_cv_ids, api_filter_batch_size):
+
+                # Introduce a delay between batches of volume filters
+                if formatted_cv_ids and volume_filter_batch_ids[0] != formatted_cv_ids[0]:
+                    LOGGER.debug(f"Waiting {Constants.CV_BRAKE_TIME}s between issue request batches.")
+                    await sleep(Constants.CV_BRAKE_TIME)
+
+
+                # Initial call for the first page of issues for this batch of volumes
                 try:
-                    results = await self.__call_api(
+                    initial_results = await self.__call_api(
                         session,
                         '/issues',
-                        {'field_list': self.issue_field_list,
-                        'filter': f'volume:{"|".join(id_batch)}'}
+                        {
+                            'field_list': self.issue_field_list,
+                            'filter': f'volume:{"|".join(volume_filter_batch_ids)}',
+                            'limit': 100 # Fetch first 100 issues
+                        },
+                        # Provide a default empty list for results in case of failure
+                        {'results': []}
                     )
-
                 except CVRateLimitReached:
-                    break
+                    # If even the first call fails after retries, stop processing this batch
+                    LOGGER.warning(f"Failed to fetch initial issue batch for volumes {volume_filter_batch_ids} after retries.")
+                    continue # Move to the next batch of volume filters
 
-                issue_infos += [
+
+                issue_infos.extend([
                     self.__format_issue_output(r)
-                    for r in results['results']
-                ]
+                    for r in initial_results.get('results', []) # Safely access results
+                ])
 
-                if results['number_of_total_results'] > 100:
+                total_results = initial_results.get('number_of_total_results', 0)
+                if total_results > 100:
+                    # If there are more than 100 issues, fetch subsequent pages
+                    # Batch the offsets for subsequent requests
+                    offset_batch_size = 10 # As used in original code
 
                     for offset_batch in batched(
-                        range(100, results['number_of_total_results'], 100),
-                        10
+                        range(100, total_results, 100), # Start from 100, step by 100
+                        offset_batch_size # Number of offset requests to make concurrently
                     ):
 
+                        # Introduce a delay between batches of offset requests for this volume filter batch
                         if offset_batch[0] != 100:
-                            # From second round on
-                            LOGGER.debug(
-                                f"Waiting {Constants.CV_BRAKE_TIME}s to keep the CV rate limit happy")
+                            LOGGER.debug(f"Waiting {Constants.CV_BRAKE_TIME}s between issue offset batches.")
                             await sleep(Constants.CV_BRAKE_TIME)
 
-                        tasks = [
-                            self.__call_api(
-                                session,
-                                '/issues',
-                                {
-                                    'field_list': self.issue_field_list,
-                                    'filter': f'volume:{"|".join(id_batch)}',
-                                    'offset': offset
-                                },
-                                {'results': []}
+
+                        tasks = []
+                        for offset in offset_batch:
+                            # __call_api handles retries and key cycling for each request
+                            tasks.append(
+                                self.__call_api(
+                                    session,
+                                    '/issues',
+                                    {
+                                        'field_list': self.issue_field_list,
+                                        'filter': f'volume:{"|".join(volume_filter_batch_ids)}',
+                                        'offset': offset,
+                                        'limit': 100 # Fetch 100 issues per request
+                                    },
+                                    # Provide a default empty list for results in case of failure
+                                    {'results': []}
+                                )
                             )
-                            for offset in offset_batch
-                        ]
+
                         responses = await gather(*tasks)
 
                         for batch in responses:
-                            issue_infos += [
-                                self.__format_issue_output(r)
-                                for r in batch['results']
-                            ]
+                             if not isinstance(batch, dict) or 'results' not in batch:
+                                  LOGGER.warning("Skipping an issue offset batch due to previous API call failure.")
+                                  continue # Skip processing this batch if it doesn't have 'results'
 
-            return issue_infos
+                             issue_infos.extend([
+                                 self.__format_issue_output(r)
+                                 for r in batch.get('results', [])
+                             ])
+
+            return issue_infos # Return the accumulated list of issue infos
 
     async def search_volumes(
         self,
@@ -609,43 +780,60 @@ class ComicVine:
         LOGGER.debug(f'Searching for volumes with the query {query}')
 
         try:
+            # Check if the query looks like a ComicVine ID and format it
             if query.startswith(('4050-', 'cv:')):
                 try:
-                    query = to_full_string_cv_id((query,))[0]
+                    query_id_str = to_full_string_cv_id((query,))[0]
+                    if not query_id_str:
+                         return [] # Return empty list if conversion results in empty string
+
+                    async with AsyncSession() as session:
+                        # Directly fetch the volume by ID using __call_api (with retries)
+                        result = await self.__call_api(
+                            session,
+                            f'/volume/{query_id_str}',
+                            {'field_list': self.search_field_list}
+                            # Do not provide a default, so VolumeNotMatched or other errors are raised
+                        )
+                        # Wrap the single result in a list to match expected format
+                        results = [result.get('results')] if result and result.get('results') else []
 
                 except ValueError:
-                    return []
+                    # Invalid ID format that doesn't match to_full_string_cv_id
+                    LOGGER.warning(f"Invalid ComicVine ID format for direct volume fetch: {query}")
+                    return [] # Return empty list for invalid ID format
 
-                if not query:
-                    return []
-
-                async with AsyncSession() as session:
-                    results = [(await self.__call_api(
-                        session,
-                        f'/volume/{query}',
-                        {'field_list': self.search_field_list}
-                    ))['results']]
 
             else:
+                # Standard search using the search endpoint
                 async with AsyncSession() as session:
-                    results = (await self.__call_api(
+                    # Use __call_api for the search request (with retries)
+                    result = await self.__call_api(
                         session,
                         '/search',
                         {
                             'query': query,
                             'resources': 'volume',
-                            'limit': 50,
+                            'limit': 50, # Limit search results
                             'field_list': self.search_field_list
                         }
-                    ))['results']
+                        # Provide a default empty list for results in case of failure
+                        , {'results': []}
+                    )
+                    results = result.get('results', []) # Safely access results
 
-        except CVRateLimitReached:
-            return []
+        except (CVRateLimitReached, InvalidComicVineApiKey, ClientError) as e:
+             # Catch exceptions from __call_api and return empty list for search
+             LOGGER.warning(f"Search volumes failed after retries for query '{query}': {e}")
+             return []
 
-        if not results or results == [[]]:
-            return []
+
+        if not results:
+            return [] # Return empty list if no results found
+
 
         return self.__format_search_output(results)
+
 
     async def filenames_to_cvs(self,
         file_datas: Sequence[FilenameData],
@@ -674,35 +862,37 @@ class ComicVine:
                 .append(file_data)
             )
 
-        # Titles to search results
+        # Titles to search results concurrently. search_volumes now handles retries.
         responses = await gather(*(
             self.search_volumes(title)
             for title in titles_to_files
         ))
 
-        # Filter for each title: title, only_english
+        # Filter search results for each title based on initial matching criteria
         titles_to_results: Dict[str, List[VolumeMetadata]] = {}
-        for title, response in zip(titles_to_files, responses):
+        for title, response in zip(titles_to_files.keys(), responses): # Use keys() to iterate through titles
             titles_to_results[title] = [
-                r for r in response
+                r for r in response # response is already a List[VolumeMetadata] from search_volumes
                 if _match_title(title, r['title'])
                 and (
-                    only_english and not r['translated']
+                    only_english and not r.get('translated', False) # Safely access translated
                     or
                     not only_english
                 )
             ]
 
+        # Match filenames to the filtered search results
         for title, files in titles_to_files.items():
             for file in files:
-                # Filter: SV - issue_count
+                # Further filter results based on Special Version and issue count
                 filtered_results = [
-                    r for r in titles_to_results[title]
-                    if file['special_version'] not in self.one_issue_match
-                    or r['issue_count'] == 1
+                    r for r in titles_to_results.get(title, []) # Safely access results for the title
+                    if file.get('special_version') not in self.one_issue_match # Safely access special_version
+                    or r.get('issue_count', 0) == 1 # Safely access issue_count
                 ]
 
                 if not filtered_results:
+                    # No matching result found for this file
                     results[file] = {
                         'id': None,
                         'title': None,
@@ -711,24 +901,23 @@ class ComicVine:
                     }
                     continue
 
-                # Pref: exact year (1 point, also matches fuzzy year),
-                #       fuzzy year (1 point),
-                #       volume number (2 points)
+                # Sort remaining results based on matching criteria preference
                 filtered_results.sort(key=lambda r:
-                    int(r['year'] == file['year'])
-                    + int(_match_year(r['year'], file['year']))
+                    int(r.get('year') == file.get('year')) # Safely access year
+                    + int(_match_year(r.get('year'), file.get('year'))) # Safely access year for _match_year
                     + int(
-                        file['volume_number'] is not None
-                        and r['volume_number'] == file['volume_number']
+                        file.get('volume_number') is not None and r.get('volume_number') == file.get('volume_number') # Safely access volume_number
                     ) * 2,
                     reverse=True
                 )
 
+                # Select the best matched result
                 matched_result = filtered_results[0]
                 results[file] = {
-                    'id': matched_result['comicvine_id'],
-                    'title': f"{matched_result['title']} ({matched_result['year']})",
-                    'issue_count': matched_result['issue_count'],
-                    'link': matched_result['site_url']}
+                    'id': matched_result.get('comicvine_id'), # Safely access comicvine_id
+                    'title': f"{matched_result.get('title', 'Unknown')} ({matched_result.get('year', 'Unknown')})", # Provide defaults
+                    'issue_count': matched_result.get('issue_count'), # Safely access issue_count
+                    'link': matched_result.get('site_detail_url')} # Safely access site_detail_url
+
 
         return results
